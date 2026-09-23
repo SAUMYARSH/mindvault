@@ -14,7 +14,7 @@ extern crate alloc;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
-    IntoVal, String, Val, Vec,
+    IntoVal, String, Symbol, Val, Vec,
 };
 
 // ~5s ledgers → 17,280 per day. Persistent entries are bumped ~30 days on each
@@ -269,6 +269,10 @@ pub const EVENT_SCHEMA: &[(&str, &str)] = &[
     ("propose", "(owner: Address, proposed: Address)"),
     ("cancel", "owner: Address"),
     ("setlisted", "(old_listed: bool, new_listed: bool)"),
+    (
+        "lifecycle",
+        "(old_state: ResourceState, new_state: ResourceState, actor: Address, reason: Option<Symbol>)",
+    ),
     ("setterms", "terms_hash: String"),
     ("setadmin", "new_admin: Address"),
     ("nomadmin", "new_admin: Address"),
@@ -1235,6 +1239,9 @@ impl VaultRegistry {
     /// Set a resource's creator-controlled listing state. Only
     /// `Listed <-> Delisted` transitions are accepted; all other lifecycle
     /// states reject this method with `InvalidLifecycleTransition`.
+    ///
+    /// Emits the established `setlisted` event, and — for an actual state
+    /// change — a `lifecycle` event naming the creator with no reason set.
     pub fn set_listed(env: Env, id: String, listed: bool) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
         Self::validate_resource_id(&id)?;
@@ -1255,7 +1262,7 @@ impl VaultRegistry {
                 .publish((symbol_short!("setlisted"), id), (old_listed, listed));
             return Ok(());
         }
-        Self::transition_creator_state(&env, &mut resource, next)?;
+        Self::transition_creator_state(&env, &mut resource, next, None)?;
         env.events()
             .publish((symbol_short!("setlisted"), id), (old_listed, listed));
         Ok(())
@@ -1270,15 +1277,24 @@ impl VaultRegistry {
     /// delisted resource, and may restore it (or a post-dispute `Frozen`
     /// resolution) through `reactivate_resource`. This lifecycle freeze is
     /// separate from `freeze_metadata`.
+    ///
+    /// Emits a `lifecycle` event with a `freeze` reason.
     pub fn freeze_resource(env: Env, id: String) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
         Self::validate_resource_id(&id)?;
         let mut resource = Self::load(&env, &id)?;
         resource.creator.require_auth();
-        Self::transition_creator_state(&env, &mut resource, ResourceState::Frozen)
+        Self::transition_creator_state(
+            &env,
+            &mut resource,
+            ResourceState::Frozen,
+            Some(symbol_short!("freeze")),
+        )
     }
 
     /// Place an active resource under an admin-controlled dispute hold.
+    ///
+    /// Emits a `lifecycle` event with a `dispute` reason.
     pub fn open_dispute(env: Env, id: String, admin: Address) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
         Self::validate_resource_id(&id)?;
@@ -1290,11 +1306,19 @@ impl VaultRegistry {
         ) {
             return Err(Error::InvalidLifecycleTransition);
         }
-        Self::transition_state(&env, &mut resource, ResourceState::Disputed);
+        Self::transition_state(
+            &env,
+            &mut resource,
+            ResourceState::Disputed,
+            &admin,
+            Some(symbol_short!("dispute")),
+        );
         Ok(())
     }
 
     /// Resolve a disputed resource to `Listed`, `Delisted`, or `Frozen`.
+    ///
+    /// Emits a `lifecycle` event with a `resolve` reason.
     pub fn resolve_dispute(
         env: Env,
         id: String,
@@ -1313,12 +1337,21 @@ impl VaultRegistry {
         {
             return Err(Error::InvalidLifecycleTransition);
         }
-        Self::transition_state(&env, &mut resource, state);
+        Self::transition_state(
+            &env,
+            &mut resource,
+            state,
+            &admin,
+            Some(symbol_short!("resolve")),
+        );
         Ok(())
     }
 
     /// Emergency-delist a disputed resource. Only the current admin may call
     /// this, and only while the resource is in the `Disputed` state.
+    ///
+    /// Emits a `lifecycle` event with an `emergency` reason. That reason is
+    /// what lets a consumer tell an admin takedown from a creator delist.
     pub fn emergency_delist(env: Env, id: String, admin: Address) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
         Self::validate_resource_id(&id)?;
@@ -1327,7 +1360,13 @@ impl VaultRegistry {
         if resource.state != ResourceState::Disputed {
             return Err(Error::InvalidLifecycleTransition);
         }
-        Self::transition_state(&env, &mut resource, ResourceState::Delisted);
+        Self::transition_state(
+            &env,
+            &mut resource,
+            ResourceState::Delisted,
+            &admin,
+            Some(symbol_short!("emergency")),
+        );
         Ok(())
     }
 
@@ -1343,7 +1382,8 @@ impl VaultRegistry {
     /// creator path out of `Frozen`, and always flips the `listed` projection
     /// and listed-count index back to active.
     ///
-    /// Emits a `reactive` event whose topic carries the resource `id`.
+    /// Emits a `lifecycle` event with a `reactive` reason, followed by the
+    /// established `reactive` event whose topic carries the resource `id`.
     ///
     /// Errors deterministically:
     /// - [`Error::Unauthorized`] — caller is not the resource creator
@@ -1363,7 +1403,14 @@ impl VaultRegistry {
         ) {
             return Err(Error::InvalidLifecycleTransition);
         }
-        Self::transition_state(&env, &mut resource, ResourceState::Listed);
+        let actor = resource.creator.clone();
+        Self::transition_state(
+            &env,
+            &mut resource,
+            ResourceState::Listed,
+            &actor,
+            Some(symbol_short!("reactive")),
+        );
         env.events().publish((symbol_short!("reactive"), id), ());
         Ok(())
     }
@@ -1378,6 +1425,8 @@ impl VaultRegistry {
     /// place and stays readable through `get` for audit, and the global
     /// `Index`/`Count` pair is deliberately untouched: `Count` is monotonic
     /// and finding a resource's slot in it would cost an unbounded scan.
+    ///
+    /// Emits a `lifecycle` event with a `tombstone` reason.
     pub fn tombstone_resource(env: Env, id: String, admin: Address) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
         Self::validate_resource_id(&id)?;
@@ -1394,7 +1443,13 @@ impl VaultRegistry {
         let owned = Self::creator_count(&env, &resource.creator);
         Self::set_creator_count(&env, &resource.creator, owned.saturating_sub(1));
 
-        Self::transition_state(&env, &mut resource, ResourceState::Tombstoned);
+        Self::transition_state(
+            &env,
+            &mut resource,
+            ResourceState::Tombstoned,
+            &admin,
+            Some(symbol_short!("tombstone")),
+        );
         Ok(())
     }
 
@@ -2911,6 +2966,7 @@ impl VaultRegistry {
         env: &Env,
         resource: &mut Resource,
         next: ResourceState,
+        reason: Option<Symbol>,
     ) -> Result<(), Error> {
         let allowed = matches!(
             (resource.state, next),
@@ -2922,11 +2978,27 @@ impl VaultRegistry {
         if !allowed {
             return Err(Error::InvalidLifecycleTransition);
         }
-        Self::transition_state(env, resource, next);
+        let actor = resource.creator.clone();
+        Self::transition_state(env, resource, next, &actor, reason);
         Ok(())
     }
 
-    fn transition_state(env: &Env, resource: &mut Resource, next: ResourceState) {
+    /// Apply a lifecycle state change and announce it.
+    ///
+    /// Every lifecycle path funnels through here, so this is where the
+    /// `lifecycle` event is published. Its topic carries the resource `id`;
+    /// its payload is `(old_state, new_state, actor, reason)`. `reason` names
+    /// the entry point that drove the transition for the paths that have a
+    /// distinct one — an admin `emergency` delist versus a plain creator
+    /// delist, for instance — and is unset otherwise.
+    fn transition_state(
+        env: &Env,
+        resource: &mut Resource,
+        next: ResourceState,
+        actor: &Address,
+        reason: Option<Symbol>,
+    ) {
+        let previous = resource.state;
         let was_listed = resource.state == ResourceState::Listed;
         let becomes_listed = next == ResourceState::Listed;
         resource.state = next;
@@ -2938,6 +3010,10 @@ impl VaultRegistry {
         } else if was_listed && !becomes_listed {
             Self::bump_listed_count(env, -1);
         }
+        env.events().publish(
+            (symbol_short!("lifecycle"), resource.id.clone()),
+            (previous, next, actor.clone(), reason),
+        );
     }
 
     /// Adjust the listed-count index by a signed delta. Panics on underflow

@@ -1181,7 +1181,7 @@ fn set_listed_event_emits_old_and_new_state_delist() {
     client.set_listed(&id, &false);
 
     assert_eq!(
-        env.events().all(),
+        events_with_topic(&env, symbol_short!("setlisted")),
         soroban_sdk::vec![
             &env,
             (
@@ -1208,7 +1208,7 @@ fn set_listed_event_emits_old_and_new_state_relist() {
     // Delist, then relist — check both events individually
     client.set_listed(&id, &false);
     assert_eq!(
-        env.events().all(),
+        events_with_topic(&env, symbol_short!("setlisted")),
         soroban_sdk::vec![
             &env,
             (
@@ -1221,7 +1221,7 @@ fn set_listed_event_emits_old_and_new_state_relist() {
 
     client.set_listed(&id, &true);
     assert_eq!(
-        env.events().all(),
+        events_with_topic(&env, symbol_short!("setlisted")),
         soroban_sdk::vec![
             &env,
             (
@@ -1266,7 +1266,7 @@ fn delist_convenience_method_emits_old_and_new_state() {
     client.delist(&id);
 
     assert_eq!(
-        env.events().all(),
+        events_with_topic(&env, symbol_short!("setlisted")),
         soroban_sdk::vec![
             &env,
             (
@@ -1304,7 +1304,7 @@ fn set_listed_and_delist_events_are_consistent() {
 
     // Check that set_listed(false) and delist() emit identical (true, false) data.
     client.set_listed(&id1, &false);
-    let ev_set_listed = env.events().all();
+    let ev_set_listed = events_with_topic(&env, symbol_short!("setlisted"));
     assert_eq!(
         ev_set_listed,
         soroban_sdk::vec![
@@ -1318,7 +1318,7 @@ fn set_listed_and_delist_events_are_consistent() {
     );
 
     client.delist(&id2);
-    let ev_delist = env.events().all();
+    let ev_delist = events_with_topic(&env, symbol_short!("setlisted"));
     assert_eq!(
         ev_delist,
         soroban_sdk::vec![
@@ -3866,6 +3866,26 @@ extern crate std;
 
 fn topic0_symbol(env: &Env, topics: &soroban_sdk::Vec<Val>) -> Option<Symbol> {
     Symbol::try_from_val(env, &topics.get(0)?).ok()
+}
+
+/// Events from the most recent invocation whose first topic is `topic`.
+///
+/// Lifecycle transitions emit `lifecycle` alongside whatever else the entry
+/// point publishes, so a test that pins one topic's exact payload selects it
+/// rather than asserting over the whole invocation.
+fn events_with_topic(
+    env: &Env,
+    topic: Symbol,
+) -> soroban_sdk::Vec<(Address, soroban_sdk::Vec<Val>, Val)> {
+    let all = env.events().all();
+    let mut out = soroban_sdk::Vec::new(env);
+    for i in 0..all.len() {
+        let entry = all.get(i).unwrap();
+        if topic0_symbol(env, &entry.1) == Some(topic.clone()) {
+            out.push_back(entry);
+        }
+    }
+    out
 }
 
 fn find_event<D>(env: &Env, contract: &Address, topic: &str) -> Option<D>

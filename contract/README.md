@@ -495,6 +495,7 @@ apart, so update all three together.
 | `propose`   | `(owner: Address, proposed: Address)`                                                    | `propose_transfer()` succeeds                              |
 | `cancel`    | `owner: Address`                                                                         | `cancel_transfer()` succeeds                               |
 | `setlisted` | `(old_listed: bool, new_listed: bool)`                                                   | `set_listed()` (and `delist()`) succeeds                   |
+| `lifecycle` | `(old_state: ResourceState, new_state: ResourceState, actor: Address, reason: Option<Symbol>)` | Any `ResourceState` transition, creator- or admin-driven |
 | `setterms`  | `terms_hash: String`                                                                     | `set_terms_hash()` succeeds                                |
 | `setadmin`  | `new_admin: Address`                                                                     | The first (bootstrap) `nominate_new_admin()` call succeeds |
 | `nomadmin`  | `new_admin: Address`                                                                     | A subsequent `nominate_new_admin()` call succeeds          |
@@ -536,6 +537,18 @@ Both `set_listed(id, false)` and `delist(id)` produce an identical `setlisted`
 event — `delist` is a thin convenience wrapper that calls `set_listed`.
 For backwards compatibility, no-op listing calls still emit the corresponding
 `setlisted` event but do not count as lifecycle transitions.
+
+`lifecycle` covers every `ResourceState` transition. It is published from the
+single internal choke point all of them pass through, so no transition can be
+added without one. Its payload names the state on both sides, the address that
+acted, and a `reason` symbol identifying the entry point: `freeze` for
+`freeze_resource()`, `dispute` for `open_dispute()`, `resolve` for
+`resolve_dispute()`, `emergency` for `emergency_delist()`, `tombstone` for
+`tombstone_resource()`, and `reactive` for `reactivate_resource()`. The creator
+listing path leaves `reason` unset, because `setlisted` already describes it.
+
+That `reason` is what separates an admin `emergency` takedown from a creator
+delist: both land on `Delisted`, and `setlisted` alone cannot tell them apart.
 
 ### Resource lifecycle state machine
 
