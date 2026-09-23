@@ -37,7 +37,11 @@ vi.mock("@x402/stellar/exact/client", () => ({ ExactStellarScheme: vi.fn() }));
 vi.mock("@x402/fetch", () => ({
   wrapFetchWithPayment: vi.fn(),
   x402Client: vi.fn(function () {
-    return { register: vi.fn() };
+    return {
+      register: vi.fn(),
+      onAfterPaymentCreation: vi.fn(),
+      onPaymentResponse: vi.fn(),
+    };
   }),
 }));
 

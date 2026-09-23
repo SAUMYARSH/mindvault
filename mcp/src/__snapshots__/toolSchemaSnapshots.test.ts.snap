@@ -888,6 +888,9 @@ exports[`tool schema snapshots > mindvault_metrics > output schema 1`] = `
     "payments": {
       "type": "object",
     },
+    "settlements": {
+      "type": "object",
+    },
     "since": {
       "type": [
         "string",

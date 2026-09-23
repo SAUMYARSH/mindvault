@@ -3,7 +3,9 @@ import {
   createMetricsRecorder,
   measureTool,
   metricsEnabledFromEnv,
+  trackPaymentLeg,
   type MetricsRecorder,
+  type PaymentLifecycle,
 } from "./metrics.js";
 
 describe("metricsEnabledFromEnv", () => {
@@ -29,12 +31,13 @@ describe("disabled (noop) recorder", () => {
     const recorder = createMetricsRecorder(false, 30000);
     expect(recorder.enabled).toBe(false);
     recorder.recordToolCall("mindvault_buy", 12, false);
-    recorder.recordPayment(false);
+    recorder.recordPaidRequest({ payment: "settled", ok: false });
     const snap = recorder.snapshot();
     expect(snap.enabled).toBe(false);
     expect(snap.tools).toEqual({});
     expect(snap.totals).toEqual({ calls: 0, errors: 0, budgetExceeded: 0 });
     expect(snap.payments).toEqual({ attempts: 0, failures: 0 });
+    expect(snap.settlements).toEqual({ attempts: 0, failures: 0 });
   });
 });
 
@@ -61,10 +64,46 @@ describe("active recorder", () => {
 
   it("tracks payment attempts and failures", () => {
     const recorder = createMetricsRecorder(true, 30000);
-    recorder.recordPayment(true);
-    recorder.recordPayment(false);
-    recorder.recordPayment(true);
+    recorder.recordPaidRequest({ payment: "settled", ok: true });
+    recorder.recordPaidRequest({ payment: "failed", ok: false });
+    recorder.recordPaidRequest({ payment: "settled", ok: true });
     expect(recorder.snapshot().payments).toEqual({ attempts: 3, failures: 1 });
+  });
+
+  it("counts a paid-then-rejected request as a settled payment and a failed settlement", () => {
+    const recorder = createMetricsRecorder(true, 30000);
+    recorder.recordPaidRequest({ payment: "settled", ok: false });
+    const snap = recorder.snapshot();
+    expect(snap.payments).toEqual({ attempts: 1, failures: 0 });
+    expect(snap.settlements).toEqual({ attempts: 1, failures: 1 });
+  });
+
+  it("does not count a payment for a request that never answered a 402", () => {
+    const recorder = createMetricsRecorder(true, 30000);
+    recorder.recordPaidRequest({ payment: "none", ok: false });
+    const snap = recorder.snapshot();
+    expect(snap.payments).toEqual({ attempts: 0, failures: 0 });
+    expect(snap.settlements).toEqual({ attempts: 1, failures: 1 });
+  });
+
+  it("counts a payment that never settled in both legs", () => {
+    const recorder = createMetricsRecorder(true, 30000);
+    recorder.recordPaidRequest({ payment: "failed", ok: false });
+    const snap = recorder.snapshot();
+    expect(snap.payments).toEqual({ attempts: 1, failures: 1 });
+    expect(snap.settlements).toEqual({ attempts: 1, failures: 1 });
+  });
+
+  it("keeps payment failures a subset of payment attempts across mixed outcomes", () => {
+    const recorder = createMetricsRecorder(true, 30000);
+    recorder.recordPaidRequest({ payment: "settled", ok: true });
+    recorder.recordPaidRequest({ payment: "settled", ok: false });
+    recorder.recordPaidRequest({ payment: "failed", ok: false });
+    recorder.recordPaidRequest({ payment: "none", ok: false });
+    const snap = recorder.snapshot();
+    expect(snap.payments).toEqual({ attempts: 3, failures: 1 });
+    expect(snap.settlements).toEqual({ attempts: 4, failures: 3 });
+    expect(snap.payments.failures).toBeLessThanOrEqual(snap.payments.attempts);
   });
 
   it("clamps non-finite/negative durations to zero", () => {
@@ -82,10 +121,13 @@ describe("active recorder", () => {
     const recorder = createMetricsRecorder(true, 30000);
     const before = recorder.snapshot().since;
     recorder.recordToolCall("mindvault_browse", 5, true);
+    recorder.recordPaidRequest({ payment: "settled", ok: false });
     recorder.reset();
     const snap = recorder.snapshot();
     expect(snap.totals).toEqual({ calls: 0, errors: 0, budgetExceeded: 0 });
     expect(snap.tools).toEqual({});
+    expect(snap.payments).toEqual({ attempts: 0, failures: 0 });
+    expect(snap.settlements).toEqual({ attempts: 0, failures: 0 });
     expect(snap.since).not.toBeNull();
     expect(before).not.toBeNull();
   });
@@ -107,6 +149,81 @@ describe("active recorder", () => {
   });
 });
 
+describe("trackPaymentLeg", () => {
+  function fakeClient(): {
+    client: PaymentLifecycle;
+    paymentCreated: () => Promise<void>;
+    paymentResponse: (settleResponse?: { success: boolean }) => Promise<void>;
+  } {
+    let afterCreation: (context: unknown) => Promise<void> = async () => {};
+    let onResponse: (context: {
+      settleResponse?: { success: boolean };
+    }) => Promise<void> = async () => {};
+    const client: PaymentLifecycle = {
+      onAfterPaymentCreation(hook) {
+        afterCreation = hook;
+        return client;
+      },
+      onPaymentResponse(hook) {
+        onResponse = hook;
+        return client;
+      },
+    };
+    return {
+      client,
+      paymentCreated: () => afterCreation({}),
+      paymentResponse: (settleResponse) => onResponse(settleResponse ? { settleResponse } : {}),
+    };
+  }
+
+  it("reports no payment when the request never answered a 402", () => {
+    const { client } = fakeClient();
+    expect(trackPaymentLeg(client)()).toBe("none");
+  });
+
+  it("reports a settled payment when the facilitator confirmed it", async () => {
+    const { client, paymentCreated, paymentResponse } = fakeClient();
+    const paymentLeg = trackPaymentLeg(client);
+    await paymentCreated();
+    await paymentResponse({ success: true });
+    expect(paymentLeg()).toBe("settled");
+  });
+
+  it("reports a failed payment when the facilitator rejected it", async () => {
+    const { client, paymentCreated, paymentResponse } = fakeClient();
+    const paymentLeg = trackPaymentLeg(client);
+    await paymentCreated();
+    await paymentResponse({ success: false });
+    expect(paymentLeg()).toBe("failed");
+  });
+
+  it("reports a failed payment when a submitted payment never came back", async () => {
+    const { client, paymentCreated } = fakeClient();
+    const paymentLeg = trackPaymentLeg(client);
+    await paymentCreated();
+    expect(paymentLeg()).toBe("failed");
+  });
+
+  it("reports a settled payment when a retried payload settles after a failure", async () => {
+    const { client, paymentCreated, paymentResponse } = fakeClient();
+    const paymentLeg = trackPaymentLeg(client);
+    await paymentCreated();
+    await paymentResponse({ success: false });
+    await paymentCreated();
+    await paymentResponse({ success: true });
+    expect(paymentLeg()).toBe("settled");
+  });
+
+  it("stays settled when the response carries no settlement details", async () => {
+    const { client, paymentCreated, paymentResponse } = fakeClient();
+    const paymentLeg = trackPaymentLeg(client);
+    await paymentCreated();
+    await paymentResponse({ success: true });
+    await paymentResponse();
+    expect(paymentLeg()).toBe("settled");
+  });
+});
+
 describe("measureTool", () => {
   function counting(): { recorder: MetricsRecorder; calls: [string, number, boolean][] } {
     const calls: [string, number, boolean][] = [];
@@ -114,13 +231,14 @@ describe("measureTool", () => {
       enabled: true,
       toolDurationBudgetMs: 30000,
       recordToolCall: (tool, duration, ok) => calls.push([tool, duration, ok]),
-      recordPayment: () => {},
+      recordPaidRequest: () => {},
       snapshot: () => ({
         enabled: true,
         since: null,
         toolDurationBudgetMs: 30000,
         totals: { calls: 0, errors: 0, budgetExceeded: 0 },
         payments: { attempts: 0, failures: 0 },
+        settlements: { attempts: 0, failures: 0 },
         tools: {},
       }),
       reset: () => {},

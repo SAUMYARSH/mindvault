@@ -46,6 +46,8 @@ import {
   measureTool,
   metricsEnabledFromEnv,
   resolveToolDurationBudget,
+  trackPaymentLeg,
+  type PaymentLeg,
 } from "./metrics.js";
 import {
   createMockFetch,
@@ -725,11 +727,26 @@ function requireApiKey(): string {
   return apiKey;
 }
 
-function makePaidFetch(wallet: AgentWallet) {
+/**
+ * A payment-enabled fetch paired with a reader for the x402 payment leg of the
+ * request it made, so callers can record what the payment did independently of
+ * what the response said.
+ */
+interface PaidFetch {
+  fetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+  paymentLeg: () => PaymentLeg;
+}
+
+function makePaidFetch(wallet: AgentWallet): PaidFetch {
   const signer = createEd25519Signer(wallet.secretKey, NETWORK);
   const scheme = new ExactStellarScheme(signer);
-  const client = new x402Client().register(NETWORK, scheme);
-  return wrapFetchWithPayment(withTimeout(httpFetch, "payment", TIMEOUTS.payment), client);
+  const client = new x402Client();
+  client.register(NETWORK, scheme);
+  const paymentLeg = trackPaymentLeg(client);
+  return {
+    fetch: wrapFetchWithPayment(withTimeout(httpFetch, "payment", TIMEOUTS.payment), client),
+    paymentLeg,
+  };
 }
 
 interface BalanceDetails {
@@ -1447,15 +1464,21 @@ async function publish(args: {
 
   const paidFetch = makePaidFetch(wallet);
 
-  const verifyRes = await paidFetch(`${BASE_URL}/verify-content`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      content: `Title: ${args.title}\nDescription: ${args.description ?? ""}\nURL: ${args.externalUrl}`,
-      resourceId: resource.id,
-    }),
-  });
-  metrics.recordPayment(verifyRes.ok);
+  let verifyRes: Response;
+  try {
+    verifyRes = await paidFetch.fetch(`${BASE_URL}/verify-content`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        content: `Title: ${args.title}\nDescription: ${args.description ?? ""}\nURL: ${args.externalUrl}`,
+        resourceId: resource.id,
+      }),
+    });
+  } catch (err) {
+    metrics.recordPaidRequest({ payment: paidFetch.paymentLeg(), ok: false });
+    throw err;
+  }
+  metrics.recordPaidRequest({ payment: paidFetch.paymentLeg(), ok: verifyRes.ok });
 
   const verifyData = await verifyRes.json().catch(() => null);
 
@@ -1585,12 +1608,12 @@ export async function buy(
   let res: Response;
   try {
     await onProgress?.(2, 4, "Submitting payment");
-    res = await paidFetch(`${BASE_URL}/resources/${resourceId}`);
+    res = await paidFetch.fetch(`${BASE_URL}/resources/${resourceId}`);
   } catch (err) {
-    metrics.recordPayment(false);
+    metrics.recordPaidRequest({ payment: paidFetch.paymentLeg(), ok: false });
     throw mcpError(mapTransportError({ operation: "Buy failed", source: "x402", error: err }));
   }
-  metrics.recordPayment(res.ok);
+  metrics.recordPaidRequest({ payment: paidFetch.paymentLeg(), ok: res.ok });
   if (!res.ok) {
     const text = await res.text();
     throwHttpError({

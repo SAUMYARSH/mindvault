@@ -326,6 +326,7 @@ export const METRICS_OUTPUT_SCHEMA = {
     toolDurationBudgetMs: { type: ["integer", "null"] },
     totals: { type: "object" },
     payments: { type: "object" },
+    settlements: { type: "object" },
     tools: { type: "object" },
     message: { type: "string" },
   },

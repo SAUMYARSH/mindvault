@@ -18,13 +18,42 @@ export interface ToolMetric {
   budgetExceeded: number;
 }
 
+/**
+ * The x402 payment leg of a single paid request: `settled` when the facilitator
+ * confirmed the payment, `failed` when a payment was submitted but never
+ * confirmed, and `none` when the request finished without paying because no 402
+ * challenge was ever answered.
+ */
+export type PaymentLeg = "settled" | "failed" | "none";
+
+/**
+ * Outcome of one request made through a paid fetch. The two legs are
+ * independent: `payment` says whether money moved, `ok` whether the request the
+ * payment bought returned a usable response. A publish that pays and is then
+ * rejected on content grounds is a settled payment and a failed settlement, not
+ * a failed payment.
+ */
+export interface PaidRequestOutcome {
+  payment: PaymentLeg;
+  ok: boolean;
+}
+
+/** Attempt and failure counters for one leg of the paid request flow. */
+export interface LegMetric {
+  attempts: number;
+  failures: number;
+}
+
 export interface MetricsSnapshot {
   enabled: boolean;
   /** ISO timestamp of when collection (re)started, or null when disabled. */
   since: string | null;
   toolDurationBudgetMs: number | null;
   totals: { calls: number; errors: number; budgetExceeded: number };
-  payments: { attempts: number; failures: number };
+  /** Requests that carried an x402 payment, with the subset that never settled. */
+  payments: LegMetric;
+  /** Requests made through a paid fetch, with the subset that did not deliver. */
+  settlements: LegMetric;
   tools: Record<string, ToolMetric>;
 }
 
@@ -32,9 +61,45 @@ export interface MetricsRecorder {
   readonly enabled: boolean;
   readonly toolDurationBudgetMs: number;
   recordToolCall(tool: string, durationMs: number, ok: boolean): void;
-  recordPayment(ok: boolean): void;
+  recordPaidRequest(outcome: PaidRequestOutcome): void;
   snapshot(): MetricsSnapshot;
   reset(): void;
+}
+
+/**
+ * The part of the x402 client surface needed to observe the payment leg. Kept
+ * structural so this module stays free of transport and protocol imports.
+ */
+export interface PaymentLifecycle {
+  onAfterPaymentCreation(hook: (context: unknown) => Promise<void>): unknown;
+  onPaymentResponse(
+    hook: (context: { settleResponse?: { success: boolean } }) => Promise<void>,
+  ): unknown;
+}
+
+/**
+ * Watch an x402 client and report the payment leg of the requests it makes.
+ *
+ * The client announces a created payload once it answers a 402 challenge and a
+ * settle response once the paid request completes, so a request that never paid
+ * stays distinguishable from one that paid and was then rejected downstream.
+ * A client is built per paid operation, so the returned reader describes that
+ * operation's request.
+ */
+export function trackPaymentLeg(client: PaymentLifecycle): () => PaymentLeg {
+  let submitted = false;
+  let settled = false;
+  client.onAfterPaymentCreation(async () => {
+    submitted = true;
+  });
+  client.onPaymentResponse(async (context) => {
+    submitted = true;
+    if (context.settleResponse?.success === true) settled = true;
+  });
+  return () => {
+    if (!submitted) return "none";
+    return settled ? "settled" : "failed";
+  };
 }
 
 const TRUTHY = new Set(["1", "true", "yes", "on"]);
@@ -60,12 +125,16 @@ function emptyToolMetric(): ToolMetric {
   return { calls: 0, errors: 0, totalDurationMs: 0, maxDurationMs: 0, budgetExceeded: 0 };
 }
 
+function emptyLegMetric(): LegMetric {
+  return { attempts: 0, failures: 0 };
+}
+
 /** Disabled recorder — zero overhead, always reports an empty, disabled snapshot. */
 class NoopMetricsRecorder implements MetricsRecorder {
   readonly enabled = false;
   readonly toolDurationBudgetMs = 0;
   recordToolCall(): void {}
-  recordPayment(): void {}
+  recordPaidRequest(): void {}
   reset(): void {}
   snapshot(): MetricsSnapshot {
     return {
@@ -73,7 +142,8 @@ class NoopMetricsRecorder implements MetricsRecorder {
       since: null,
       toolDurationBudgetMs: null,
       totals: { calls: 0, errors: 0, budgetExceeded: 0 },
-      payments: { attempts: 0, failures: 0 },
+      payments: emptyLegMetric(),
+      settlements: emptyLegMetric(),
       tools: {},
     };
   }
@@ -84,7 +154,8 @@ class ActiveMetricsRecorder implements MetricsRecorder {
   readonly toolDurationBudgetMs: number;
   private since = new Date();
   private tools = new Map<string, ToolMetric>();
-  private payments = { attempts: 0, failures: 0 };
+  private payments = emptyLegMetric();
+  private settlements = emptyLegMetric();
 
   constructor(budgetMs: number) {
     this.toolDurationBudgetMs = budgetMs;
@@ -101,15 +172,20 @@ class ActiveMetricsRecorder implements MetricsRecorder {
     this.tools.set(tool, metric);
   }
 
-  recordPayment(ok: boolean): void {
-    this.payments.attempts += 1;
-    if (!ok) this.payments.failures += 1;
+  recordPaidRequest(outcome: PaidRequestOutcome): void {
+    if (outcome.payment !== "none") {
+      this.payments.attempts += 1;
+      if (outcome.payment === "failed") this.payments.failures += 1;
+    }
+    this.settlements.attempts += 1;
+    if (!outcome.ok) this.settlements.failures += 1;
   }
 
   reset(): void {
     this.since = new Date();
     this.tools.clear();
-    this.payments = { attempts: 0, failures: 0 };
+    this.payments = emptyLegMetric();
+    this.settlements = emptyLegMetric();
   }
 
   snapshot(): MetricsSnapshot {
@@ -129,6 +205,7 @@ class ActiveMetricsRecorder implements MetricsRecorder {
       toolDurationBudgetMs: this.toolDurationBudgetMs,
       totals: { calls, errors, budgetExceeded },
       payments: { ...this.payments },
+      settlements: { ...this.settlements },
       tools,
     };
   }
